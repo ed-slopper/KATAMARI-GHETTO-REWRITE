@@ -1,0 +1,188 @@
+diff --git a/src/KatamariDamacy/AdjustableAnimationController.ts b/src/KatamariDamacy/AdjustableAnimationController.ts
+new file mode 100644
+index 0000000..cd75f34
+--- /dev/null
++++ b/src/KatamariDamacy/AdjustableAnimationController.ts
+@@ -0,0 +1,57 @@
++// Copied from BanjoKazooie/render.ts so the Katamari scene does not drag in unrelated renderers.
++import * as Viewer from '../viewer.js';
++
++export class AdjustableAnimationController {
++    private time = 0;
++    private initialized = false;
++    private phaseFrames = 0;
++
++    constructor(private fps = 30) {}
++
++    public setTimeFromViewerInput(viewerInput: Viewer.ViewerRenderInput): void {
++        this.time = viewerInput.time/1000;
++        if (!this.initialized) {
++            this.initialized = true;
++            // treat phaseFrames as the intended start frame
++            this.phaseFrames -= this.time * this.fps;
++        }
++    }
++
++    // set a new fps for a controller that might not have been updated recently
++    // used for pooled renderers like particles
++    public init(newFPS: number, newPhase = 0) {
++        this.initialized = false;
++        this.fps = newFPS;
++        this.phaseFrames = newPhase;
++    }
++
++    // adjust the framerate, while either preserving the current phase value or setting a new one
++    public adjust(newFPS: number, newPhase?: number) {
++        // assume time is current, so just adjust the values now
++        if (newPhase !== undefined)
++            this.phaseFrames = newPhase - this.time * newFPS;
++        else // preserve old phase
++            this.phaseFrames += (this.fps - newFPS) * this.time;
++        this.fps = newFPS;
++    }
++
++    public getTimeInFrames(): number {
++        if (!this.initialized)
++            return this.phaseFrames;
++        return this.time*this.fps + this.phaseFrames;
++    }
++
++    public getTimeInSeconds(): number {
++        if (this.fps === 0)
++            return 0; // not sure what this should mean
++        else if (this.initialized)
++            return this.time + this.phaseFrames/this.fps;
++        else
++            return this.phaseFrames/this.fps;
++    }
++
++    public resetPhase(): void {
++        this.initialized = false;
++        this.phaseFrames = 0;
++    }
++}
+diff --git a/src/KatamariDamacy/objects.ts b/src/KatamariDamacy/objects.ts
+index 450fc27..1a71145 100644
+--- a/src/KatamariDamacy/objects.ts
++++ b/src/KatamariDamacy/objects.ts
+@@ -12,7 +12,7 @@ import { BINModelInstance, BINModelSectorData } from "./render.js";
+ import { GfxDevice } from "../gfx/platform/GfxPlatform.js";
+ import { GfxRenderCache } from "../gfx/render/GfxRenderCache.js";
+ import { ObjectAnimationList, applyCurve } from "./animation.js";
+-import { AdjustableAnimationController } from "../BanjoKazooie/render.js";
++import { AdjustableAnimationController } from "./AdjustableAnimationController.js";
+ 
+ const scratchVec3 = vec3.create();
+ 
+@@ -146,6 +146,9 @@ export class ObjectRenderer {
+     public altObject: ObjectRenderer | null = null;
+     public useAltObject = false;
+ 
++    // KatamariGame: when set, the object is stuck to the ball and this is its full transform (katamari space).
++    public stuckMatrix: mat4 | null = null;
++
+     private animations: ObjectAnimationList | null = null;
+     private animationIndex = -1;
+     private animationController = new AdjustableAnimationController(30);
+@@ -286,6 +289,26 @@ export class ObjectRenderer {
+         if (!this.visible)
+             return;
+ 
++        if (this.stuckMatrix !== null) {
++            mat4.copy(this.modelMatrix, this.stuckMatrix);
++            mat4.getTranslation(this.prevPosition, this.modelMatrix);
++            if (this.animations !== null && this.animationIndex >= 0) {
++                this.animationController.setTimeFromViewerInput(viewerInput);
++                this.animate();
++            } else {
++                for (let i = 0; i < this.modelInstances.length; i++) {
++                    const inst = this.modelInstances[i];
++                    computeModelMatrixR(inst.modelMatrix, inst.euler[0], inst.euler[1], inst.euler[2]);
++                    setMatrixTranslation(inst.modelMatrix, inst.translation);
++                }
++            }
++            mat4.mul(scratchMatrix, toNoclip, this.modelMatrix);
++            const dist = objectDist(viewerInput, scratchMatrix);
++            for (let i = 0; i < this.modelInstances.length; i++)
++                this.modelInstances[i].prepareToRender(renderInstManager, viewerInput, scratchMatrix, currentPalette, dist);
++            return;
++        }
++
+         // Game runs at 30fps.
+         const deltaTimeFrames = clamp(viewerInput.deltaTime / 33.0, 0.0, 2.0);
+ 
+diff --git a/src/KatamariDamacy/scenes.ts b/src/KatamariDamacy/scenes.ts
+index 47b9699..317bcf8 100644
+--- a/src/KatamariDamacy/scenes.ts
++++ b/src/KatamariDamacy/scenes.ts
+@@ -165,8 +165,11 @@ export function fillSceneParamsData(d: Float32Array, camera: Camera, lightingInd
+ const bindingLayouts: GfxBindingLayoutDescriptor[] = [{ numUniformBuffers: 2, numSamplers: 1 }];
+ 
+ const tutorialScratch = vec3.create();
+-class KatamariDamacyRenderer implements Viewer.SceneGfx {
+-    private currentAreaNo: number = 0;
++export class KatamariDamacyRenderer implements Viewer.SceneGfx {
++    public currentAreaNo: number = 0;
++    public game: any = null;
++    // KatamariGame: creates one more copy of an object type that this level already has loaded.
++    public spawnExtra: ((modelIndex: number, modelMatrix: mat4) => ObjectRenderer | null) | null = null;
+     private sceneTexture = new GfxrTemporalTexture();
+     public renderHelper: GfxRenderHelper;
+     private renderInstListMain = new GfxRenderInstList();
+@@ -292,6 +295,8 @@ class KatamariDamacyRenderer implements Viewer.SceneGfx {
+         for (let i = 0; i < this.objectRenderers.length; i++)
+             this.objectRenderers[i].prepareToRender(this.renderHelper.renderInstManager, viewerInput, katamariWorldSpaceToNoclipSpace,
+                 this.currentPalette, this.cameraGameState);
++        if (this.game !== null)
++            this.game.prepareToRender(this.renderHelper.renderInstManager, viewerInput);
+ 
+         this.renderHelper.renderInstManager.popTemplate();
+         this.renderHelper.prepareToRender();
+@@ -303,6 +308,8 @@ class KatamariDamacyRenderer implements Viewer.SceneGfx {
+             this.stageAreaRenderers[i].setActiveAreaNo(areaNo);
+         for (let i = 0; i < this.objectRenderers.length; i++)
+             this.objectRenderers[i].setActiveAreaNo(areaNo);
++        if (this.game !== null)
++            this.game.onAreaChanged();
+     }
+ 
+     public createPanels(): UI.Panel[] {
+@@ -370,7 +377,7 @@ class KatamariDamacyRenderer implements Viewer.SceneGfx {
+     }
+ }
+ 
+-class KatamariLevelSceneDesc implements Viewer.SceneDesc {
++export class KatamariLevelSceneDesc implements Viewer.SceneDesc {
+     constructor(public id: string, private index: number, public name: string, public cameraSpeedMult: number = 1) {
+     }
+ 
+@@ -568,6 +575,29 @@ class KatamariLevelSceneDesc implements Viewer.SceneDesc {
+             }
+         }
+ 
++        const templateSpawns = new Map<number, BIN.MissionSetupObjectSpawn>();
++        for (let area = 0; area < missionSetupBin.objectSpawns.length; area++)
++            for (const spawn of missionSetupBin.objectSpawns[area])
++                if (!templateSpawns.has(spawn.modelIndex))
++                    templateSpawns.set(spawn.modelIndex, spawn);
++        renderer.spawnExtra = (modelIndex: number, modelMatrix: mat4) => {
++            const template = templateSpawns.get(modelIndex);
++            if (template === undefined)
++                return null;
++            const spawn: BIN.MissionSetupObjectSpawn = {
++                ...template, modelMatrix: mat4.clone(modelMatrix),
++                moveType: -1, linkAction: 0, dispOnAreaNo: 0, dispOffAreaNo: -1, tableIndex: -1,
++            };
++            const object = new ObjectRenderer(device, gfxCache, missionSetupBin.objectModels[modelIndex], objectDatas[modelIndex], spawn);
++            if (missionSetupBin.objectDefs[modelIndex].animated) {
++                if (!animationCache.has(spawn.objectId))
++                    animationCache.set(spawn.objectId, parseAnimationList(animationData, spawn.objectId));
++                object.initAnimation(assertExists(animationCache.get(spawn.objectId)));
++            }
++            renderer.objectRenderers.push(object);
++            return object;
++        };
++
+         return renderer;
+     }
+ }
